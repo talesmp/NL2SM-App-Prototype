@@ -1,0 +1,17 @@
+python-dotenv
+ipdb
+jupyterlab
+ipywidgets
+requests
+
+openai
+anthropic
+google-generativeai
+ollama
+tiktoken
+
+gradio
+plantuml
+plantweb
+
+duckdb
