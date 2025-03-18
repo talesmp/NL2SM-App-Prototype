@@ -1,7 +1,6 @@
 # db_utils.py
 
 import sqlite3
-import os
 
 # Path to your SQLite DB file
 DB_PATH = "nl2sm-app-prototype/nl2sm_oltp.sqlite3"
