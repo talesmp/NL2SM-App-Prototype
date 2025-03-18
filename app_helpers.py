@@ -4,19 +4,20 @@ import os
 from dataclasses import dataclass
 from typing import Iterator, List
 import sqlite3
+import json
 
 import gradio as gr
 from plantweb.render import render_file
 import uuid
 
-from llm_utils import (
+from app_utils_llm import (
     LLMProvider,
     OpenAIModels,
     # MetaAIModels,
     AnthropicModels,
     process_llm_request
 )
-from db_utils import store_usage_log, DB_PATH
+from app_utils_db import store_usage_log, DB_PATH, retrieve_usage_logs
 
 ###############################################################################
 # Conversation State
@@ -25,7 +26,8 @@ from db_utils import store_usage_log, DB_PATH
 class ConversationState:
     original_srs: str = ""
     distilled_srs: str = ""
-    generated_plantuml: str = ""
+    orig_generated_plantuml: str = ""
+    dist_generated_plantuml: str = ""
     chat_history: list = None
 
     def __post_init__(self):
@@ -100,22 +102,43 @@ Task 2: Compare the extracted description with the original SRS text below:
 {srs_text}
 
 Provide:
-1. A similarity score between 0 and 100
-2. A list of specific discrepancies
-3. Any missing or additional elements in the UML diagram that weren't specified in the SRS
+1. The extracted description of the system represented by the PlantUML script.
+2. A similarity score between 0 and 100
+3. A list of specific discrepancies
+4. Any missing elements in the UML diagram that weren't specified in the SRS
+5. Any additional elements in the UML diagram that weren't specified in the SRS
 
-Format your response as:
-Similarity Score: X/100
+Format your response as JSON with five keys: 'extracted_description' 'similarity_score', 'discrepancies', 'missing_elements' and 'additional_elements'.
+'extracted_description' should be a string.
+'similarity_score' should be a float between 0 and 100.
+'discrepancies', 'missing_elements' and 'additional_elements' should be lists of strings.
 
-Discrepancies:
-- ...
+This is an example of the structure of the JSON that you must follow:
+```json
+    "extracted_description": "The system is a Book Store with classes for Book, Author, Publisher, and User. Books can be bought and sold by the Bookstore and Individuals. Users can borrow books from the Bookstore. Books have titles, authors, and ISBNs. Users have names and can register with the Bookstore.",
+    "similarity_score": 75.0,
+    "discrepancies": ["- The UML diagram doesn't explicitly show that Publishers cannot buy books (no purchase method)", "- The lending rules constraints aren't fully represented in the UML (e.g., can't show that Individuals cannot lend borrowed books)"],
+    "missing_elements": ["- No indication of Copy's default owner being Publisher", "- No representation of inter-library lending capability"],
+    "additional_elements": ["- Methods that weren't explicitly mentioned in SRS:  * transferOwnership() in Owner class  * sellBook() in Bookstore and Individual  * purchaseBook() in multiple classes", "- The User class is more detailed than specified in the SRS, including attributes like id, name, and registrationDate"]
+```
 
-Missing Elements:
-- ...
-
-Additional Elements:
-- ...
+Respond only with the JSON object, without any additional text or explanation.
 """
+
+
+def clean_and_parse_json_response(text):
+    # Remove the starting ```json if present
+    if text.startswith("```json"):
+        text = text[len("```json"):].strip()
+    # Remove the ending ``` if present
+    if text.endswith("```"):
+        text = text[:-len("```")].strip()
+    try:
+        parsed_data = json.loads(text)
+    except json.JSONDecodeError as e:
+        print("Error parsing JSON:", e)
+        return None
+    return parsed_data
 
 
 def extract_plantuml_code(raw_text: str) -> str:
@@ -150,8 +173,6 @@ def generate_plantuml_diagram(script: str) -> str:
         if not script.strip().startswith("@startuml"):
             script = f"@startuml\n{script}\n@enduml"
 
-        state.generated_plantuml = script
-
         # Create a unique file name
         unique_id = uuid.uuid4().hex
         dot_file = f"mygraph_{unique_id}.dot"
@@ -182,6 +203,11 @@ def handle_generate_uml(srs_type: str, plantuml_script: str, db_store: bool = Tr
     if not plantuml_script.strip():
         return None
 
+    if srs_type == "original":
+        state.orig_generated_plantuml = plantuml_script
+    if srs_type == "distilled":
+        state.dist_generated_plantuml = plantuml_script
+
     outfile = generate_plantuml_diagram(plantuml_script)
     image_data = None
     if outfile:
@@ -203,66 +229,13 @@ def handle_generate_uml(srs_type: str, plantuml_script: str, db_store: bool = Tr
             )
     return outfile
 
-
-def handle_send(srs_type: str, srs_text: str, provider: LLMProvider, model: str, temperature: float, chatbot: list, db_store: bool = True):
-    """
-    Submit SRS to LLM, get partial streaming responses, extract final UML script,
-    store to DB.  Gradio generator function (hence 'yield').
-    """
-    if not srs_text.strip():
-        return "", chatbot, ""
-
-    # Add SRS text to chatbot
-    chatbot.append((srs_text, ""))
-
-    if srs_type == "original":
-        state.original_srs = srs_text
-    else:
-        state.distilled_srs = srs_text
-
-    # Make the UML prompt
-    prompt = generate_uml_prompt(srs_text)
-    response_generator = process_llm_request(provider, model, prompt, temperature)
-
-    full_response = ""
-    for partial_chunk in response_generator:
-        full_response = partial_chunk
-        chatbot[-1] = (srs_text, partial_chunk)
-        yield "", chatbot, full_response
-
-    # Extract UML
-    clean_uml = extract_plantuml_code(full_response)
-
-    if db_store:
-        if srs_type == "original":
-            store_usage_log(
-                event_type="SEND_LLM_ORIG_SRS",
-                llm_provider=provider,
-                llm_model=model,
-                temperature=temperature,
-                original_srs_text=srs_text,
-                plantuml_script_orig_srs=clean_uml
-            )
-        else:
-            store_usage_log(
-                event_type="SEND_LLM_DIST_SRS",
-                llm_provider=provider,
-                llm_model=model,
-                temperature=temperature,
-                distilled_srs_text=srs_text,
-                plantuml_script_dist_srs=clean_uml
-            )
-
-    yield "", chatbot, clean_uml
-
-
 def handle_check_similarity(srs_type: str, provider: LLMProvider, model: str, temperature: float, db_store: bool = True) -> str:
     """Compare SRS text to the UML diagram content in state."""
     if srs_type == "original":
-        if not state.original_srs or not state.generated_plantuml:
+        if not state.original_srs or not state.orig_generated_plantuml:
             return "Please provide the original SRS text and UML script first."
 
-        prompt = check_similarity_prompt(state.original_srs, state.generated_plantuml)
+        prompt = check_similarity_prompt(state.original_srs, state.orig_generated_plantuml)
         response_generator = process_llm_request(provider, model, prompt, temperature, stream=False)
         similarity_text = "".join(list(response_generator))  # Collect all pieces
 
@@ -273,17 +246,17 @@ def handle_check_similarity(srs_type: str, provider: LLMProvider, model: str, te
                 llm_model=model,
                 temperature=temperature,
                 original_srs_text=state.original_srs,
-                plantuml_script_orig_srs=state.generated_plantuml,
+                plantuml_script_orig_srs=state.orig_generated_plantuml,
                 similarity_descr_orig_srs=similarity_text
             )
 
         return similarity_text
 
-    else:
-        if not state.distilled_srs or not state.generated_plantuml:
+    if srs_type == "distilled":
+        if not state.distilled_srs or not state.dist_generated_plantuml:
             return "Please provide the distilled SRS text and UML script first."
 
-        prompt = check_similarity_prompt(state.distilled_srs, state.generated_plantuml)
+        prompt = check_similarity_prompt(state.distilled_srs, state.dist_generated_plantuml)
         response_generator = process_llm_request(provider, model, prompt, temperature, stream=False)
         similarity_text = "".join(list(response_generator))
 
@@ -294,7 +267,7 @@ def handle_check_similarity(srs_type: str, provider: LLMProvider, model: str, te
                 llm_model=model,
                 temperature=temperature,
                 distilled_srs_text=state.distilled_srs,
-                plantuml_script_dist_srs=state.generated_plantuml,
+                plantuml_script_dist_srs=state.dist_generated_plantuml,
                 similarity_descr_dist_srs=similarity_text
             )
 
@@ -346,93 +319,8 @@ def handle_send_non_stream(srs_type: str, srs_text: str, provider: LLMProvider, 
     return srs_text, chatbot, clean_uml
 
 
-def handle_all_in_one(srs_type: str, srs_text: str, provider: LLMProvider, model: str, temperature: float, chatbot: list):
-    """
-    1) handle_send_non_stream => obtains UML script
-    2) handle_generate_uml => renders UML diagram
-    3) handle_check_similarity => obtains similarity analysis
-    """
-    # Step 1: Non-stream SRS => UML script
-    new_srs_text, new_chatbot, uml_script = handle_send_non_stream(
-        srs_type, srs_text, provider, model, temperature, chatbot, db_store=False
-    )
-
-    # Step 2: Generate UML diagram
-    outfile = handle_generate_uml(srs_type, uml_script, db_store=False)
-    image_data = None
-    if outfile:
-        with open(outfile, 'rb') as f:
-            image_data = f.read()
-
-    # Step 3: Check similarity
-    similarity_text = handle_check_similarity(srs_type, provider, model, temperature, db_store=False)
-
-    # We store everything at once
-    if srs_type == "original":
-        store_usage_log(
-            event_type="ALL_IN_ONE_ORIG_SRS",
-            llm_provider=provider,
-            llm_model=model,
-            temperature=temperature,
-            original_srs_text=new_srs_text,
-            plantuml_script_orig_srs=uml_script,
-            uml_image_data_orig_srs=image_data,
-            similarity_descr_orig_srs=similarity_text
-        )
-
-    # Return what the UI expects:
-    return new_srs_text, new_chatbot, uml_script, outfile, similarity_text
-
-
-def handle_distill_and_all_in_one(original_srs_text: str, provider: LLMProvider, model: str, temperature: float, chatbot: list):
-    """
-    1) Distills the original SRS.
-    2) Calls handle_all_in_one(...) with srs_type='distilled'.
-    """
-    # Step 1: Distill
-    distill_prompt, distilled_srs = distill_srs_text(provider, model, temperature, original_srs_text, db_store=False)
-
-    # Step 2: Pass the distilled SRS to handle_all_in_one
-    #         (We set srs_type="distilled")
-    new_srs_text, new_chatbot, uml_script, outfile, similarity_text = handle_all_in_one(
-        srs_type="distilled",
-        srs_text=distilled_srs,
-        provider=provider,
-        model=model,
-        temperature=temperature,
-        chatbot=chatbot
-    )
-    
-    image_data = None
-    if outfile:
-        with open(outfile, 'rb') as f:
-            image_data = f.read()
-
-    store_usage_log(
-            event_type="ALL_IN_ONE_DIST_SRS",
-            original_srs_text=original_srs_text,
-            llm_provider=provider,
-            llm_model=model,
-            temperature=temperature,
-            prompt_distill_srs=distill_prompt,
-            distilled_srs_text=distilled_srs,
-            plantuml_script_dist_srs=uml_script,
-            uml_image_data_dist_srs=image_data,
-            similarity_descr_dist_srs=similarity_text
-        )
-
-    # Return them. Notice we return distilled_srs as the *first* item
-    return (
-        distilled_srs,       # <--- The newly distilled SRS
-        new_srs_text,        # from handle_all_in_one
-        new_chatbot,         # from handle_all_in_one
-        uml_script,          # from handle_all_in_one
-        outfile,             # from handle_all_in_one
-        similarity_text      # from handle_all_in_one
-    )
-
-
 def handle_all_in_one_original_and_distilled(
+    srs_id: str,
     original_srs_text: str,
     provider: LLMProvider,
     model: str,
@@ -501,6 +389,19 @@ def handle_all_in_one_original_and_distilled(
         db_store=False
     )
 
+    parsed_orig_sim_text = clean_and_parse_json_response(orig_sim_text)
+    if parsed_orig_sim_text:
+        # Save the values in the required variables
+        orig_extr_desc = parsed_orig_sim_text.get("extracted_description", "")
+        orig_sim_score = parsed_orig_sim_text.get("similarity_score", "")
+        
+        # Concatenate discrepancies, missing_elements, and additional_elements with their keys
+        orig_discrepancies = "\n".join(parsed_orig_sim_text.get("discrepancies", []))
+        orig_missing_elements = "\n".join(parsed_orig_sim_text.get("missing_elements", []))
+        orig_additional_elements = "\n".join(parsed_orig_sim_text.get("additional_elements", []))
+        
+        orig_sim_desc = f"discrepancies:\n{orig_discrepancies}\n\nmissing_elements:\n{orig_missing_elements}\n\nadditional_elements:\n{orig_additional_elements}"
+
     ################################################################
     # (B) Distillation
     ################################################################
@@ -542,25 +443,43 @@ def handle_all_in_one_original_and_distilled(
         db_store=False
     )
 
+    parsed_dist_sim_text = clean_and_parse_json_response(dist_sim_text)
+    print(parsed_dist_sim_text)
+    if parsed_dist_sim_text:
+        # Save the values in the required variables
+        dist_extr_desc = parsed_dist_sim_text.get("extracted_description", "")
+        dist_sim_score = parsed_dist_sim_text.get("similarity_score", "")
+        
+        # Concatenate discrepancies, missing_elements, and additional_elements with their keys
+        dist_discrepancies = "\n".join(parsed_dist_sim_text.get("discrepancies", []))
+        dist_missing_elements = "\n".join(parsed_dist_sim_text.get("missing_elements", []))
+        dist_additional_elements = "\n".join(parsed_dist_sim_text.get("additional_elements", []))
+        
+        dist_sim_desc = f"discrepancies:\n{dist_discrepancies}\n\nmissing_elements:\n{dist_missing_elements}\n\nadditional_elements:\n{dist_additional_elements}"
+
     ################################################################
     # (D) Now log EVERYTHING at once
     ################################################################
     store_usage_log(
-        event_type="ALL_IN_ONE_ORIG_AND_DIST",
+        event_type="FIRST_PASS",
         llm_provider=provider,
         llm_model=model,
         temperature=temperature,
+        srs_id=srs_id,
         # SRS Original data
         original_srs_text=orig_srs_text,
         plantuml_script_orig_srs=orig_uml_script,
         uml_image_data_orig_srs=orig_image_data,
-        similarity_descr_orig_srs=orig_sim_text,
+        extracted_uml_descr_orig_srs=orig_extr_desc,
+        similarity_score_orig_srs=orig_sim_score,
+        similarity_descr_orig_srs=orig_sim_desc,
         # SRS Distilled data
-        prompt_distill_srs=dist_prompt,
         distilled_srs_text=dist_srs_text,
         plantuml_script_dist_srs=dist_uml_script,
         uml_image_data_dist_srs=dist_image_data,
-        similarity_descr_dist_srs=dist_sim_text
+        extracted_uml_descr_dist_srs=dist_extr_desc,
+        similarity_score_dist_srs=dist_sim_score,
+        similarity_descr_dist_srs=dist_sim_desc
     )
 
     ################################################################
@@ -586,6 +505,264 @@ def handle_all_in_one_original_and_distilled(
         dist_sim_text        # 12) similarity analysis for distilled
     )
 
- 
 
+def handle_send_backfeed_non_stream(
+        srs_type: str, 
+        provider: LLMProvider, 
+        model: str, 
+        temperature: float, 
+        chatbot: list, 
+        original_srs_text: str = None,
+        distilled_srs_text: str = None,
+        plantuml_script_orig_srs: str = None,
+        plantuml_script_dist_srs: str = None,
+        similarity_descr_orig_srs: str = None,
+        similarity_descr_dist_srs: str = None
+    ):
+    """
+    Non-stream version of handle_backfeed_send. 
+    This function calls the LLM to generate a new UML script from the SRS text, the previously generated UML script and the similarity analysis content.
+    """
+    if srs_type == "original":
+        if not original_srs_text.strip():
+            return "", chatbot, ""
+
+        chatbot.append((original_srs_text, ""))
+        state.original_srs = original_srs_text
+
+        def regenerate_orig_plantuml_prompt(original_srs_text, plantuml_script_orig_srs, similarity_descr_orig_srs):
+            return f"""
+            You are a software requirements analyst. You have been provided with the following information regarding an iterative process to generate a UML Class Diagram from a Software Requirements Specification (SRS):
+        1. Original Software Requirements Specification: 
+        {original_srs_text}
+
+        2. Previously generated UML script: 
+        {plantuml_script_orig_srs}
+        
+        3. Previous Similarity Analysis highlighting discrepancies, missing elements, and additional elements:
+        {similarity_descr_orig_srs}
+
+        Based on this information, please generate a new UML script that accurately represents the system described in the Software Requirements Specification.
+        Generate only the PlantUML script, starting with @startuml and ending with @enduml. Include appropriate classes, attributes, methods, and relationships.
+        """
+        prompt = regenerate_orig_plantuml_prompt(original_srs_text, plantuml_script_orig_srs, similarity_descr_orig_srs)
+        response_generator = process_llm_request(provider, model, prompt, temperature, stream=False)
+
+        full_response = "".join(list(response_generator))
+        chatbot[-1] = (original_srs_text, full_response)
+
+        clean_uml = extract_plantuml_code(full_response)
+
+    if srs_type == "distilled":
+        if not distilled_srs_text.strip():
+            return "", chatbot, ""
+
+        chatbot.append((distilled_srs_text, ""))
+        state.distilled_srs = distilled_srs_text
+
+        def regenerate_dist_plantuml_prompt(distilled_srs_text, plantuml_script_dist_srs, similarity_descr_dist_srs):
+            return f"""
+            You are a software requirements analyst. You have been provided with the following information regarding an iterative process to generate a UML Class Diagram from a Software Requirements Specification (SRS):
+        1. Previously pruned Software Requirements Specification: 
+        {distilled_srs_text}
+
+        2. Previously generated UML script: 
+        {plantuml_script_dist_srs}
+        
+        3. Previous Similarity Analysis highlighting discrepancies, missing elements, and additional elements:
+        {similarity_descr_dist_srs}
+
+        Based on this information, please generate a new UML script that accurately represents the system described in the Software Requirements Specification.
+        Generate only the PlantUML script, starting with @startuml and ending with @enduml. Include appropriate classes, attributes, methods, and relationships.
+        """
+        prompt = regenerate_dist_plantuml_prompt(distilled_srs_text, plantuml_script_dist_srs, similarity_descr_dist_srs)
+        response_generator = process_llm_request(provider, model, prompt, temperature, stream=False)
+
+        full_response = "".join(list(response_generator))
+        chatbot[-1] = (distilled_srs_text, full_response)
+
+        clean_uml = extract_plantuml_code(full_response)
+
+    return chatbot, clean_uml
+
+
+def handle_recheck_similarity(
+        srs_type: str, 
+        provider: LLMProvider, 
+        model: str, 
+        temperature: float,
+        srs_text: str = None,
+        new_uml_script: str = None,
+        ) -> str:
+    """Compare SRS text to the UML diagram content in state."""
+    prompt = check_similarity_prompt(srs_text, new_uml_script)
+    response_generator = process_llm_request(provider, model, prompt, temperature, stream=False)
+    similarity_text = "".join(list(response_generator))  # Collect all pieces
+
+    return similarity_text
+
+
+def handle_backfeed_for_improvement(
+    srs_id: str,
+    provider: LLMProvider,
+    model: str,
+    temperature: float,
+    chatbot: list
+):
+    """
+    1) Using the SRS_ID, Provider, Model, and Temperature, retrieve from the latest log entry:
+        - Original SRS text
+        - Distilled SRS text
+        - PlantUML script for original SRS
+        - PlantUML script for distilled SRS
+        - Similarity analysis for original SRS
+        - Similarity analysis for distilled SRS
+    """
+
+    if model == "o1 mini":
+        temperature = 1.0  # Override temperature for o1-mini
+
+    # Retrieve the latest log entry
+    original_srs_text, distilled_srs_text, plantuml_script_orig_srs, plantuml_script_dist_srs, similarity_descr_orig_srs, similarity_descr_dist_srs, record_count = retrieve_usage_logs(srs_id, provider, model, temperature)
+    if original_srs_text is None:
+        return None
+
+
+    ################################################################
+    # (A) Original Flow (non-stream, UML generation, similarity)
+    ################################################################
+    # Step A1: Non-stream handle_send => get UML script (no DB logs)
+    orig_chatbot, new_orig_uml_script = handle_send_backfeed_non_stream(
+        srs_type="original",
+        provider=provider,
+        model=model,
+        temperature=temperature,
+        chatbot=chatbot,
+        original_srs_text=original_srs_text,
+        plantuml_script_orig_srs=plantuml_script_orig_srs,
+        similarity_descr_orig_srs=similarity_descr_orig_srs
+    )
+
+    # Step A2: Generate UML diagram (no DB logs)
+    new_orig_outfile = handle_generate_uml("original", new_orig_uml_script, db_store=False)
+    new_orig_image_data = None
+    if new_orig_outfile:
+        with open(new_orig_outfile, 'rb') as f:
+            new_orig_image_data = f.read()
+
+    # Step A3: Check similarity for original (no DB logs)
+    new_orig_sim_text = handle_recheck_similarity(
+        srs_type="original",
+        provider=provider,
+        model=model,
+        temperature=temperature,
+        srs_text=original_srs_text,
+        new_uml_script=new_orig_uml_script
+    )
+
+    new_parsed_orig_sim_text = clean_and_parse_json_response(new_orig_sim_text)
+    if new_parsed_orig_sim_text:
+        # Save the values in the required variables
+        new_orig_extr_desc = new_parsed_orig_sim_text.get("extracted_description", "")
+        new_orig_sim_score = new_parsed_orig_sim_text.get("similarity_score", "")
+        
+        # Concatenate discrepancies, missing_elements, and additional_elements with their keys
+        new_orig_discrepancies = "\n".join(new_parsed_orig_sim_text.get("discrepancies", []))
+        new_orig_missing_elements = "\n".join(new_parsed_orig_sim_text.get("missing_elements", []))
+        new_orig_additional_elements = "\n".join(new_parsed_orig_sim_text.get("additional_elements", []))
+        
+        new_orig_sim_desc = f"discrepancies:\n{new_orig_discrepancies}\n\nmissing_elements:\n{new_orig_missing_elements}\n\nadditional_elements:\n{new_orig_additional_elements}"
+
+    ################################################################
+    # (C) Distilled Flow (non-stream, UML generation, similarity)
+    ################################################################
+    # Step C1: Non-stream handle_send => get UML script (no DB logs)
+    dist_chatbot, new_dist_uml_script = handle_send_backfeed_non_stream(
+        srs_type="distilled",
+        provider=provider,
+        model=model,
+        temperature=temperature,
+        chatbot=orig_chatbot,
+        distilled_srs_text=distilled_srs_text,
+        plantuml_script_dist_srs=plantuml_script_dist_srs,
+        similarity_descr_dist_srs=similarity_descr_dist_srs
+    )
+
+    # Step C2: Generate UML diagram (no DB logs)
+    new_dist_outfile = handle_generate_uml("distilled", new_dist_uml_script, db_store=False)
+    new_dist_image_data = None
+    if new_dist_outfile:
+        with open(new_dist_outfile, 'rb') as f:
+            new_dist_image_data = f.read()
+
+    # Step C3: Check similarity for distilled (no DB logs)
+    new_dist_sim_text = handle_recheck_similarity(
+        srs_type="distilled",
+        provider=provider,
+        model=model,
+        temperature=temperature,
+        srs_text=distilled_srs_text,
+        new_uml_script=new_dist_uml_script
+    )
+
+    new_parsed_dist_sim_text = clean_and_parse_json_response(new_dist_sim_text)
+    if new_parsed_dist_sim_text:
+        # Save the values in the required variables
+        new_dist_extr_desc = new_parsed_dist_sim_text.get("extracted_description", "")
+        new_dist_sim_score = new_parsed_dist_sim_text.get("similarity_score", "")
+        
+        # Concatenate discrepancies, missing_elements, and additional_elements with their keys
+        new_dist_discrepancies = "\n".join(new_parsed_dist_sim_text.get("discrepancies", []))
+        new_dist_missing_elements = "\n".join(new_parsed_dist_sim_text.get("missing_elements", []))
+        new_dist_additional_elements = "\n".join(new_parsed_dist_sim_text.get("additional_elements", []))
+        
+        new_dist_sim_desc = f"discrepancies:\n{new_dist_discrepancies}\n\nmissing_elements:\n{new_dist_missing_elements}\n\nadditional_elements:\n{new_dist_additional_elements}"
+
+    ################################################################
+    # (D) Now log EVERYTHING at once
+    ################################################################
+    store_usage_log(
+        event_type=f"BACKFEED_IMPROVEMENT_{record_count}",
+        llm_provider=provider,
+        llm_model=model,
+        temperature=temperature,
+        srs_id=srs_id,
+        # SRS Original data
+        original_srs_text=original_srs_text,
+        plantuml_script_orig_srs=new_orig_uml_script,
+        uml_image_data_orig_srs=new_orig_image_data,
+        extracted_uml_descr_orig_srs=new_orig_extr_desc,
+        similarity_score_orig_srs=new_orig_sim_score,
+        similarity_descr_orig_srs=new_orig_sim_desc,
+        # SRS Distilled data
+        distilled_srs_text=distilled_srs_text,
+        plantuml_script_dist_srs=new_dist_uml_script,
+        uml_image_data_dist_srs=new_dist_image_data,
+        extracted_uml_descr_dist_srs=new_dist_extr_desc,
+        similarity_score_dist_srs=new_dist_sim_score,
+        similarity_descr_dist_srs=new_dist_sim_desc
+    )
+
+    ################################################################
+    # (E) Return the results from both flows
+    ################################################################
+    return (
+        # Original flow results
+        original_srs_text,       # 1) final original SRS text
+        orig_chatbot,        # 2) updated chatbot after original UML generation
+        new_orig_uml_script,     # 3) UML script from original flow
+        new_orig_outfile,        # 4) path to UML diagram for original
+        new_orig_sim_text,       # 5) similarity analysis for original
+
+        # Distillation
+        # dist_prompt,         # 6) the prompt used for distillation
+        distilled_srs_text,       # 7) the previously distilled SRS
+
+        # Distilled flow results
+        # dist_final_srs_text, # 8) final text from handle_send_non_stream (usually same as dist_srs_text)
+        dist_chatbot,        # 9) updated chatbot after distilled UML generation
+        new_dist_uml_script,     # 10) UML script from distilled flow
+        new_dist_outfile,        # 11) path to UML diagram for distilled
+        new_dist_sim_text        # 12) similarity analysis for distilled
+    )
 

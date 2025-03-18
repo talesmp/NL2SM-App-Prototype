@@ -1,0 +1,5 @@
+nl2sm_oltp.sqlite3
+nl2sm_oltp.sqlite3-shm
+nl2sm_oltp.sqlite3-wal
+
+__pycache__/
