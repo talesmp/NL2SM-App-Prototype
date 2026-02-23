@@ -33,7 +33,8 @@ class ConversationState:
 
 # We create a single shared instance.  Alternatively, you could
 # pass it around as needed, or store it in a Gradio State object.
-state = ConversationState()
+state_original = ConversationState()
+state_distilled = ConversationState()
 
 ###############################################################################
 # Helper Functions for prompts, UML generation, etc.
@@ -201,9 +202,9 @@ def handle_generate_uml(srs_type: str, plantuml_script: str, db_store: bool = Tr
         return None
 
     if srs_type == "original":
-        state.orig_generated_plantuml = plantuml_script
+        state_original.orig_generated_plantuml = plantuml_script
     if srs_type == "distilled":
-        state.dist_generated_plantuml = plantuml_script
+        state_distilled.dist_generated_plantuml = plantuml_script
 
     outfile = generate_plantuml_diagram(plantuml_script)
     image_data = None
@@ -229,10 +230,10 @@ def handle_generate_uml(srs_type: str, plantuml_script: str, db_store: bool = Tr
 def handle_check_similarity(srs_type: str, provider: LLMProvider, model: str, temperature: float, db_store: bool = True) -> str:
     """Compare SRS text to the UML diagram content in state."""
     if srs_type == "original":
-        if not state.original_srs or not state.orig_generated_plantuml:
+        if not state_original.original_srs or not state_original.orig_generated_plantuml:
             return "Please provide the original SRS text and UML script first."
 
-        prompt = check_similarity_prompt(state.original_srs, state.orig_generated_plantuml)
+        prompt = check_similarity_prompt(state_original.original_srs, state_original.orig_generated_plantuml)
         response_generator = process_llm_request(provider, model, prompt, temperature, stream=False)
         similarity_text = "".join(list(response_generator))  # Collect all pieces
 
@@ -242,18 +243,18 @@ def handle_check_similarity(srs_type: str, provider: LLMProvider, model: str, te
                 llm_provider=provider,
                 llm_model=model,
                 temperature=temperature,
-                original_srs_text=state.original_srs,
-                plantuml_script_orig_srs=state.orig_generated_plantuml,
+                original_srs_text=state_original.original_srs,
+                plantuml_script_orig_srs=state_original.orig_generated_plantuml,
                 similarity_descr_orig_srs=similarity_text
             )
 
         return similarity_text
 
     if srs_type == "distilled":
-        if not state.distilled_srs or not state.dist_generated_plantuml:
+        if not state_distilled.distilled_srs or not state_distilled.dist_generated_plantuml:
             return "Please provide the distilled SRS text and UML script first."
 
-        prompt = check_similarity_prompt(state.distilled_srs, state.dist_generated_plantuml)
+        prompt = check_similarity_prompt(state_distilled.distilled_srs, state_distilled.dist_generated_plantuml)
         response_generator = process_llm_request(provider, model, prompt, temperature, stream=False)
         similarity_text = "".join(list(response_generator))
 
@@ -263,8 +264,8 @@ def handle_check_similarity(srs_type: str, provider: LLMProvider, model: str, te
                 llm_provider=provider,
                 llm_model=model,
                 temperature=temperature,
-                distilled_srs_text=state.distilled_srs,
-                plantuml_script_dist_srs=state.dist_generated_plantuml,
+                distilled_srs_text=state_distilled.distilled_srs,
+                plantuml_script_dist_srs=state_distilled.dist_generated_plantuml,
                 similarity_descr_dist_srs=similarity_text
             )
 
@@ -281,9 +282,9 @@ def handle_send_non_stream(srs_type: str, srs_text: str, provider: LLMProvider, 
     chatbot.append((srs_text, ""))
 
     if srs_type == "original":
-        state.original_srs = srs_text
+        state_original.original_srs = srs_text
     if srs_type == "distilled":
-        state.distilled_srs = srs_text
+        state_distilled.distilled_srs = srs_text
 
     prompt = generate_uml_prompt(srs_text)
     response_generator = process_llm_request(provider, model, prompt, temperature, stream=False)
@@ -387,17 +388,17 @@ def handle_all_in_one_original_and_distilled(
     )
 
     parsed_orig_sim_text = clean_and_parse_json_response(orig_sim_text)
-    if parsed_orig_sim_text:
+    # if parsed_orig_sim_text:
         # Save the values in the required variables
-        orig_extr_desc = parsed_orig_sim_text.get("extracted_description", "")
-        orig_sim_score = parsed_orig_sim_text.get("similarity_score", "")
-        
-        # Concatenate discrepancies, missing_elements, and additional_elements with their keys
-        orig_discrepancies = "\n".join(parsed_orig_sim_text.get("discrepancies", []))
-        orig_missing_elements = "\n".join(parsed_orig_sim_text.get("missing_elements", []))
-        orig_additional_elements = "\n".join(parsed_orig_sim_text.get("additional_elements", []))
-        
-        orig_sim_desc = f"discrepancies:\n{orig_discrepancies}\n\nmissing_elements:\n{orig_missing_elements}\n\nadditional_elements:\n{orig_additional_elements}"
+    orig_extr_desc = parsed_orig_sim_text.get("extracted_description", "")
+    orig_sim_score = parsed_orig_sim_text.get("similarity_score", "")
+    
+    # Concatenate discrepancies, missing_elements, and additional_elements with their keys
+    orig_discrepancies = "\n".join(parsed_orig_sim_text.get("discrepancies", []))
+    orig_missing_elements = "\n".join(parsed_orig_sim_text.get("missing_elements", []))
+    orig_additional_elements = "\n".join(parsed_orig_sim_text.get("additional_elements", []))
+    
+    orig_sim_desc = f"discrepancies:\n{orig_discrepancies}\n\nmissing_elements:\n{orig_missing_elements}\n\nadditional_elements:\n{orig_additional_elements}"
 
     ################################################################
     # (B) Distillation
@@ -442,17 +443,17 @@ def handle_all_in_one_original_and_distilled(
 
     parsed_dist_sim_text = clean_and_parse_json_response(dist_sim_text)
     print(parsed_dist_sim_text)
-    if parsed_dist_sim_text:
+    # if parsed_dist_sim_text:
         # Save the values in the required variables
-        dist_extr_desc = parsed_dist_sim_text.get("extracted_description", "")
-        dist_sim_score = parsed_dist_sim_text.get("similarity_score", "")
-        
-        # Concatenate discrepancies, missing_elements, and additional_elements with their keys
-        dist_discrepancies = "\n".join(parsed_dist_sim_text.get("discrepancies", []))
-        dist_missing_elements = "\n".join(parsed_dist_sim_text.get("missing_elements", []))
-        dist_additional_elements = "\n".join(parsed_dist_sim_text.get("additional_elements", []))
-        
-        dist_sim_desc = f"discrepancies:\n{dist_discrepancies}\n\nmissing_elements:\n{dist_missing_elements}\n\nadditional_elements:\n{dist_additional_elements}"
+    dist_extr_desc = parsed_dist_sim_text.get("extracted_description", "")
+    dist_sim_score = parsed_dist_sim_text.get("similarity_score", "")
+    
+    # Concatenate discrepancies, missing_elements, and additional_elements with their keys
+    dist_discrepancies = "\n".join(parsed_dist_sim_text.get("discrepancies", []))
+    dist_missing_elements = "\n".join(parsed_dist_sim_text.get("missing_elements", []))
+    dist_additional_elements = "\n".join(parsed_dist_sim_text.get("additional_elements", []))
+    
+    dist_sim_desc = f"discrepancies:\n{dist_discrepancies}\n\nmissing_elements:\n{dist_missing_elements}\n\nadditional_elements:\n{dist_additional_elements}"
 
     ################################################################
     # (D) Now log EVERYTHING at once
@@ -525,7 +526,7 @@ def handle_send_backfeed_non_stream(
             return "", chatbot, ""
 
         chatbot.append((original_srs_text, ""))
-        state.original_srs = original_srs_text
+        state_original.original_srs = original_srs_text
 
         def regenerate_orig_plantuml_prompt(original_srs_text, plantuml_script_orig_srs, similarity_descr_orig_srs):
             return f"""
@@ -555,7 +556,7 @@ def handle_send_backfeed_non_stream(
             return "", chatbot, ""
 
         chatbot.append((distilled_srs_text, ""))
-        state.distilled_srs = distilled_srs_text
+        state_distilled.distilled_srs = distilled_srs_text
 
         def regenerate_dist_plantuml_prompt(distilled_srs_text, plantuml_script_dist_srs, similarity_descr_dist_srs):
             return f"""

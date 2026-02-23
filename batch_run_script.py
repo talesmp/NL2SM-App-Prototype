@@ -151,5 +151,5 @@ def main_batch_run_from_db(temperature=0.5, srs_ids=None):
 
 # manual_srs_input_batch_run()
 
-main_batch_run_from_db(srs_ids=[17,18], temperature=0.5)
+main_batch_run_from_db(srs_ids=[19,20], temperature=0.5)
 
